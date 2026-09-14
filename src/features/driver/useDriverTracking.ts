@@ -72,10 +72,13 @@ async function readBatteryNow(): Promise<BatteryReading> {
   try {
     if (Capacitor.isNativePlatform()) {
       const info = await Device.getBatteryInfo();
-      return {
-        p_battery: Math.round(info.batteryLevel * 100),
-        p_is_charging: info.isCharging,
-      };
+      const level =
+        typeof info.batteryLevel === 'number'
+          ? Math.round(info.batteryLevel * 100)
+          : null;
+      const charging =
+        typeof info.isCharging === 'boolean' ? info.isCharging : null;
+      return { p_battery: level, p_is_charging: charging };
     }
     const nav = navigator as NavigatorWithBattery;
     if (typeof nav.getBattery === 'function') {
@@ -91,7 +94,6 @@ async function readBatteryNow(): Promise<BatteryReading> {
     return { p_battery: null, p_is_charging: null };
   }
 }
-
 function getBatteryCached(): Promise<BatteryReading> {
   const now = Date.now();
   if (batteryCache && now - batteryCache.at < BATTERY_CACHE_MS) {
