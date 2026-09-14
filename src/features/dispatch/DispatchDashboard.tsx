@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
 import {
   Battery, BatteryCharging, BatteryLow, BatteryWarning,
@@ -45,6 +45,20 @@ const DRIVER_STATUS_RANK: Record<DriverStatus, number> = {
   on_delivery: 0,
   available: 1,
   offline: 2,
+};
+
+type LiveState = 'live' | 'connecting' | 'offline';
+
+const LIVE_DOT: Record<LiveState, string> = {
+  live: 'bg-green-500',
+  connecting: 'bg-amber-500',
+  offline: 'bg-slate-400',
+};
+
+const LIVE_LABEL: Record<LiveState, string> = {
+  live: 'Live',
+  connecting: 'Connecting',
+  offline: 'Offline',
 };
 
 export interface DriverLocation {
@@ -146,6 +160,14 @@ export function DispatchDashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [panTo, setPanTo] = useState<string | null>(null);
+  const [liveState, setLiveState] = useState<LiveState>('connecting');
+
+  // Visible driver set is fixed for the session. Held in a ref so the realtime
+  // callback always reads the latest value without re-subscribing.
+  const visibleDriverIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    visibleDriverIdsRef.current = new Set(drivers.map((d) => d.id));
+  }, [drivers]);
 
   const load = useCallback(async (): Promise<LoadResult> => {
     if (!profile) return { drivers: [], locations: {}, orders: [] };
@@ -195,6 +217,7 @@ export function DispatchDashboard() {
     };
   }, [profile]);
 
+  // Initial fetch on mount (unchanged behaviour).
   useEffect(() => {
     if (profileLoading) return;
     if (!profile) { setLoading(false); return; }
@@ -222,6 +245,80 @@ export function DispatchDashboard() {
 
     return () => { cancelled = true; };
   }, [profile, profileLoading, load]);
+
+  // Realtime deltas after the initial load. Single channel, two listeners.
+  useEffect(() => {
+    if (!profile) return;
+    if (loading) return; // wait for the initial fetch to settle
+
+    const channel = supabase
+      .channel('dispatch-dashboard')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'driver_locations' },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as { driver_id?: string };
+            if (!oldRow.driver_id) return;
+            if (!visibleDriverIdsRef.current.has(oldRow.driver_id)) return;
+            setLocations((prev) => {
+              const next = { ...prev };
+              delete next[oldRow.driver_id as string];
+              return next;
+            });
+            return;
+          }
+          const row = payload.new as DriverLocation | null;
+          if (!row || !row.driver_id) return;
+          // Out-of-scope drivers are ignored; the visible set is fixed for the session.
+          if (!visibleDriverIdsRef.current.has(row.driver_id)) return;
+          setLocations((prev) => ({ ...prev, [row.driver_id]: row }));
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders' },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as { id?: string };
+            if (!oldRow.id) return;
+            setOrders((prev) => prev.filter((o) => o.id !== oldRow.id));
+            return;
+          }
+
+          const row = payload.new as Partial<OrderRow> | null;
+          if (!row || !row.id) return;
+          const id = row.id;
+          const status = row.status;
+          const driverId = row.assigned_driver_id ?? null;
+
+          // Terminal statuses remove the order from the panel.
+          if (status === 'delivered' || status === 'cancelled') {
+            setOrders((prev) => prev.filter((o) => o.id !== id));
+            return;
+          }
+
+          const isActive = !!status && (ACTIVE_STATUSES as readonly string[]).includes(status);
+          const inScope = !!driverId && visibleDriverIdsRef.current.has(driverId);
+
+          if (isActive && inScope) {
+            setOrders((prev) => {
+              const without = prev.filter((o) => o.id !== id);
+              return [...without, row as OrderRow];
+            });
+          }
+        },
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') setLiveState('live');
+        else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setLiveState('connecting');
+        else if (status === 'CLOSED') setLiveState('offline');
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [profile, loading]);
 
   const markers = useMemo<MapMarker[]>(() => {
     const out: MapMarker[] = [];
@@ -287,10 +384,16 @@ export function DispatchDashboard() {
     <div className="mx-auto max-w-6xl space-y-4 p-4">
       <header className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">Dispatch</h1>
-        <span className="text-xs text-slate-500">
-          {drivers.length} driver{drivers.length === 1 ? '' : 's'} · {orders.length} active
-          order{orders.length === 1 ? '' : 's'}
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-slate-500">
+            {drivers.length} driver{drivers.length === 1 ? '' : 's'} · {orders.length} active
+            order{orders.length === 1 ? '' : 's'}
+          </span>
+          <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+            <span className={`inline-block h-2 w-2 rounded-full ${LIVE_DOT[liveState]}`} />
+            {LIVE_LABEL[liveState]}
+          </span>
+        </div>
       </header>
 
       {error && (
