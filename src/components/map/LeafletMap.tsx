@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -52,12 +52,43 @@ function Recenter({ lat, lng, zoom, follow }: { lat: number; lng: number; zoom: 
   return null;
 }
 
+/**
+ * Pans the map to the marker whose id matches `focusMarkerId`.
+ * - Uses a ref for `markers` so the effect only fires when the focus id
+ *   changes (not every time the parent re-renders with a fresh array).
+ * - Co-located pins carry a tiny offset in the marker array, so we naturally
+ *   centre on the offset position rather than stacking on top of a twin.
+ */
+function FocusMarker({
+  focusMarkerId,
+  markers,
+  zoom,
+}: {
+  focusMarkerId: string | null | undefined;
+  markers: MapMarker[];
+  zoom: number;
+}) {
+  const map = useMap();
+  const markersRef = useRef(markers);
+  markersRef.current = markers;
+
+  useEffect(() => {
+    if (!focusMarkerId) return;
+    const m = markersRef.current.find((x) => x.id === focusMarkerId);
+    if (!m) return;
+    map.setView([m.lat, m.lng], zoom, { animate: true });
+  }, [map, focusMarkerId, zoom]);
+
+  return null;
+}
+
 export function LeafletMap({
   center = { lat: 6.5244, lng: 3.3792 },
   zoom = 12,
   markers = [],
   className = 'h-96 w-full rounded-lg',
   follow = true,
+  focusMarkerId = null,
   onViewportChange,
 }: MapWrapperProps) {
   return (
@@ -67,6 +98,7 @@ export function LeafletMap({
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
       <Recenter lat={center.lat} lng={center.lng} zoom={zoom} follow={follow} />
+      <FocusMarker focusMarkerId={focusMarkerId} markers={markers} zoom={zoom} />
       <ViewportReporter onViewportChange={onViewportChange} />
       {markers.map((m) => {
         const tone = m.tone ?? 'primary';
