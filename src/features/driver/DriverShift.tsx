@@ -1,193 +1,432 @@
-import { useEffect, useState } from 'react';
-import {
-  Play, Square, CheckCircle2, Wifi, WifiOff, Truck,
-  PackageCheck, Navigation, Loader2,
-} from 'lucide-react';
-import toast from 'react-hot-toast';
-import { supabase, type OrderRow } from '../../lib/supabase';
-import { useProfile } from '../../lib/hooks/useProfile';
-import { useDriverTracking } from './useDriverTracking';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Capacitor, registerPlugin } from '@capacitor/core';
+import { Device } from '@capacitor/device';
+import { Preferences } from '@capacitor/preferences';
+import { Network } from '@capacitor/network';
+import type {
+  BackgroundGeolocationPlugin,
+  Location,
+  CallbackError,
+} from '@capacitor-community/background-geolocation';
+import { supabase } from '../../lib/supabase';
+import { haversineMeters } from '../../lib/geo';
+import type { Position } from '@capacitor/geolocation';
 
-const ACTIVE_STATUSES = ['confirmed', 'dispatched', 'picked', 'in_transit'] as const;
+const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation');
 
-interface NextAction {
-  next: string;
-  label: string;
-  Icon: typeof PackageCheck;
-  className: string;
+const QUEUE_KEY = 'logiflow.gps.queue.v1';
+const BATTERY_CACHE_MS = 30_000;
+
+export type GpsMode = 'HIGH' | 'BALANCED' | 'LOW' | 'PASSIVE';
+
+interface ModeConfig {
+  minIntervalMs: number;
+  minDistanceM: number;
+  distanceFilter: number;
 }
 
-function nextActionFor(status: string): NextAction | null {
-  switch (status) {
-    case 'confirmed':
-    case 'dispatched':
-      return { next: 'picked', label: 'Picked up', Icon: PackageCheck, className: 'bg-blue-600 hover:bg-blue-700' };
-    case 'picked':
-      return { next: 'in_transit', label: 'In transit', Icon: Navigation, className: 'bg-indigo-600 hover:bg-indigo-700' };
-    case 'in_transit':
-      return { next: 'delivered', label: 'Delivered', Icon: CheckCircle2, className: 'bg-green-600 hover:bg-green-700' };
-    default:
-      return null;
+const MODE_CONFIG: Record<GpsMode, ModeConfig> = {
+  HIGH:     { minIntervalMs: 0,       minDistanceM: 0,   distanceFilter: 0   },
+  BALANCED: { minIntervalMs: 5_000,   minDistanceM: 15,  distanceFilter: 15  },
+  LOW:      { minIntervalMs: 30_000,  minDistanceM: 50,  distanceFilter: 50  },
+  PASSIVE:  { minIntervalMs: 120_000, minDistanceM: 200, distanceFilter: 200 },
+};
+
+const MODE_THRASH_MS = 30_000;
+const HIGH_RADIUS_M = 500;
+const BALANCED_RADIUS_M = 5_000;
+const ACTIVE_ORDER_STATUSES = ['confirmed', 'dispatched', 'picked', 'in_transit'] as const;
+
+interface DeliveryPoint {
+  lat: number;
+  lng: number;
+}
+
+export interface QueuedFix {
+  lat: number;
+  lng: number;
+  accuracy: number | null;
+  ts: number;
+}
+
+interface Options {
+  enabled: boolean;
+}
+
+type BatteryReading = {
+  p_battery: number | null;
+  p_is_charging: boolean | null;
+};
+
+interface NavigatorBattery {
+  level: number;
+  charging: boolean;
+}
+interface NavigatorWithBattery extends Navigator {
+  getBattery?: () => Promise<NavigatorBattery>;
+}
+
+let batteryCache: { at: number; promise: Promise<BatteryReading> } | null = null;
+
+async function readBatteryNow(): Promise<BatteryReading> {
+  try {
+    if (Capacitor.isNativePlatform()) {
+      const info = await Device.getBatteryInfo();
+      return {
+        p_battery: Math.round(info.batteryLevel * 100),
+        p_is_charging: info.isCharging,
+      };
+    }
+    const nav = navigator as NavigatorWithBattery;
+    if (typeof nav.getBattery === 'function') {
+      const b = await nav.getBattery();
+      return {
+        p_battery: Math.round(b.level * 100),
+        p_is_charging: b.charging,
+      };
+    }
+    return { p_battery: null, p_is_charging: null };
+  } catch (err) {
+    console.error('Failed to read device battery', err);
+    return { p_battery: null, p_is_charging: null };
   }
 }
 
-const STATUS_LABEL: Record<string, string> = {
-  confirmed: 'Confirmed',
-  dispatched: 'Dispatched',
-  picked: 'Picked up',
-  in_transit: 'In transit',
-  delivered: 'Delivered',
-};
-
-const MILESTONES = ['picked', 'in_transit', 'delivered'] as const;
-const MILESTONE_LABEL: Record<string, string> = {
-  picked: 'Picked up',
-  in_transit: 'Transit',
-  delivered: 'Delivered',
-};
-
-function milestoneIndex(status: string): number {
-  switch (status) {
-    case 'confirmed':
-    case 'dispatched': return -1;
-    case 'picked': return 0;
-    case 'in_transit': return 1;
-    case 'delivered': return 2;
-    default: return -1;
+function getBatteryCached(): Promise<BatteryReading> {
+  const now = Date.now();
+  if (batteryCache && now - batteryCache.at < BATTERY_CACHE_MS) {
+    return batteryCache.promise;
   }
+  const promise = readBatteryNow();
+  batteryCache = { at: now, promise };
+  return promise;
 }
 
-export function DriverShift() {
-  const { profile } = useProfile();
-  const [onShift, setOnShift] = useState(false);
-  const [activeOrders, setActiveOrders] = useState<OrderRow[]>([]);
-  const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
-  const [shiftBusy, setShiftBusy] = useState(false);
+export function useDriverTracking({ enabled }: Options) {
+  const [isTracking, setIsTracking] = useState(false);
+  const [queueSize, setQueueSize] = useState(0);
+  const [lastSentAt, setLastSentAt] = useState<number | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [gpsMode, setGpsMode] = useState<GpsMode>('BALANCED');
 
-  const { isTracking, queueSize, lastSentAt, lastError, flush } = useDriverTracking({ enabled: onShift });
+  const lastSentFix = useRef<QueuedFix | null>(null);
+  const watcherId = useRef<{ native: true; id: string } | { native: false; id: string } | null>(null);
+  const online = useRef<boolean>(navigator.onLine);
 
+  // Mutex lock to prevent race conditions when writing to the queue
+  const queueLock = useRef<Promise<void>>(Promise.resolve());
+
+  // --- GPS cadence mode ---
+  const modeRef = useRef<GpsMode>('BALANCED');
+  const modeConfigRef = useRef<ModeConfig>(MODE_CONFIG.BALANCED);
+  const lastModeChangeRef = useRef<number>(0);
+  const deliveriesRef = useRef<DeliveryPoint[]>([]);
+  const enabledRef = useRef<boolean>(enabled);
+
+  useEffect(() => { enabledRef.current = enabled; }, [enabled]);
+
+  const readQueue = useCallback(async (): Promise<QueuedFix[]> => {
+    const { value } = await Preferences.get({ key: QUEUE_KEY });
+    if (!value) return [];
+    try { return JSON.parse(value) as QueuedFix[]; } catch { return []; }
+  }, []);
+
+  const writeQueue = useCallback(async (q: QueuedFix[]) => {
+    await Preferences.set({ key: QUEUE_KEY, value: JSON.stringify(q) });
+    setQueueSize(q.length);
+  }, []);
+
+  // Safe enqueue that uses the mutex
+  const enqueueFix = useCallback(async (fix: QueuedFix) => {
+    queueLock.current = queueLock.current.then(async () => {
+      const q = await readQueue();
+      q.push(fix);
+      await writeQueue(q);
+    });
+    return queueLock.current;
+  }, [readQueue, writeQueue]);
+
+  const flush = useCallback(async () => {
+    // Wait for any pending writes to finish
+    await queueLock.current;
+    const q = await readQueue();
+    if (q.length === 0) return;
+    const newest = q.reduce((a, b) => (a.ts > b.ts ? a : b));
+
+    const battery = await getBatteryCached();
+
+    const { error } = await supabase.rpc('upsert_driver_location', {
+      p_lat: newest.lat,
+      p_lng: newest.lng,
+      p_accuracy: newest.accuracy,
+      p_battery: battery.p_battery,
+      p_is_charging: battery.p_is_charging,
+    });
+
+    if (error) { setLastError(error.message); return; }
+    await writeQueue([]);
+    lastSentFix.current = newest;
+    setLastSentAt(Date.now());
+    setLastError(null);
+  }, [readQueue, writeQueue]);
+
+  const computeMode = useCallback((fix: { lat: number; lng: number }): GpsMode => {
+    // Spec: "shift off -> PASSIVE ... treat this as LOW in practice". Because
+    // the watcher is removed when the shift ends, computeMode never runs
+    // off-shift. We therefore return LOW in that (unreachable) case and
+    // surface PASSIVE as hook state when the shift actually turns off.
+    if (!enabledRef.current) return 'LOW';
+
+    const pts = deliveriesRef.current;
+    if (pts.length === 0) return 'LOW';
+
+    let minDist = Infinity;
+    for (const p of pts) {
+      const d = haversineMeters(fix, p);
+      if (d < minDist) minDist = d;
+    }
+    if (minDist <= HIGH_RADIUS_M) return 'HIGH';
+    if (minDist <= BALANCED_RADIUS_M) return 'BALANCED';
+    return 'LOW';
+  }, []);
+
+  const handleFix = useCallback(async (fix: QueuedFix) => {
+    // Recompute cadence on every fix (even ones we won't send).
+    const desired = computeMode(fix);
+    if (desired !== modeRef.current) {
+      const now = Date.now();
+      if (now - lastModeChangeRef.current >= MODE_THRASH_MS) {
+        lastModeChangeRef.current = now;
+        modeRef.current = desired;
+        modeConfigRef.current = MODE_CONFIG[desired];
+        setGpsMode(desired);
+        // Watcher restart is handled by the effect that observes gpsMode.
+      }
+    }
+
+    const cfg = modeConfigRef.current;
+    const last = lastSentFix.current;
+    const elapsed = last ? Date.now() - last.ts : Infinity;
+    const moved = last ? haversineMeters(last, fix) : Infinity;
+    const shouldSend = !last || elapsed >= cfg.minIntervalMs || moved >= cfg.minDistanceM;
+    if (!shouldSend) return;
+
+    if (!online.current) {
+      await enqueueFix(fix);
+      return;
+    }
+
+    const battery = await getBatteryCached();
+
+    const { error } = await supabase.rpc('upsert_driver_location', {
+      p_lat: fix.lat,
+      p_lng: fix.lng,
+      p_accuracy: fix.accuracy,
+      p_battery: battery.p_battery,
+      p_is_charging: battery.p_is_charging,
+    });
+
+    if (error) {
+      await enqueueFix(fix);
+      setLastError(error.message);
+      return;
+    }
+
+    lastSentFix.current = fix;
+    setLastSentAt(Date.now());
+    setLastError(null);
+  }, [computeMode, enqueueFix]);
+
+  const start = useCallback(async () => {
+    if (watcherId.current) return;
+
+    const { connected } = await Network.getStatus();
+    online.current = connected;
+
+    const { distanceFilter } = modeConfigRef.current;
+
+    if (Capacitor.isNativePlatform()) {
+      const id = await BackgroundGeolocation.addWatcher(
+        {
+          backgroundMessage: 'Tracking your delivery location',
+          backgroundTitle: 'LogiFlow — On delivery',
+          requestPermissions: true,
+          stale: false,
+          distanceFilter,
+        },
+        (position?: Location, error?: CallbackError) => {
+          if (error) { setLastError(error.message); return; }
+          if (!position) return;
+          void handleFix({
+            lat: position.latitude,
+            lng: position.longitude,
+            accuracy: position.accuracy ?? null,
+            ts: Date.now(),
+          });
+        },
+      );
+      watcherId.current = { native: true, id };
+    } else {
+      // The web watcher has no distanceFilter option: on web the mode only
+      // affects the throttling constants inside handleFix.
+      const { Geolocation } = await import('@capacitor/geolocation');
+      const id = await Geolocation.watchPosition(
+        { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
+        (pos: Position | null, err?: CallbackError) => {
+          if (err) { setLastError(err.message); return; }
+          if (!pos) return;
+          void handleFix({
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: pos.coords.accuracy ?? null,
+            ts: Date.now(),
+          });
+        },
+      );
+      watcherId.current = { native: false, id };
+    }
+
+    setIsTracking(true);
+    await flush();
+  }, [handleFix, flush]);
+
+  const stop = useCallback(async () => {
+    const w = watcherId.current;
+    if (!w) return;
+    if (w.native) {
+      await BackgroundGeolocation.removeWatcher({ id: w.id });
+    } else {
+      const { Geolocation } = await import('@capacitor/geolocation');
+      await Geolocation.clearWatch({ id: w.id });
+    }
+    watcherId.current = null;
+    setIsTracking(false);
+  }, []);
+
+  // --- Active deliveries: fetch once + keep fresh via Realtime ---
   useEffect(() => {
-    if (!profile) return;
     let cancelled = false;
+    let channel: ReturnType<typeof supabase.channel> | null = null;
 
-    const load = async () => {
-      const { data, error } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('assigned_driver_id', profile.id)
-        .in('status', [...ACTIVE_STATUSES])
-        .order('created_at');
-      if (error) toast.error(error.message);
-      if (!cancelled) setActiveOrders((data as OrderRow[]) ?? []);
-    };
+    (async () => {
+      const { data: auth } = await supabase.auth.getUser();
+      const user = auth?.user;
+      if (!user || cancelled) return;
 
-    void load();
-    const ch = supabase
-      .channel(`driver-orders-${profile.id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders', filter: `assigned_driver_id=eq.${profile.id}` }, () => { void load(); })
-      .subscribe();
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      if (!profile || cancelled) return;
+      const profileId = (profile as { id: string }).id;
+
+      const load = async () => {
+        const { data, error } = await supabase
+          .from('orders')
+          .select('delivery_lat,delivery_lng')
+          .eq('assigned_driver_id', profileId)
+          .in('status', [...ACTIVE_ORDER_STATUSES]);
+        if (error) {
+          console.error('Failed to load active orders for GPS mode', error);
+          return;
+        }
+        if (cancelled) return;
+        const pts: DeliveryPoint[] = [];
+        for (const row of (data ?? []) as Array<{ delivery_lat: number | null; delivery_lng: number | null }>) {
+          if (typeof row.delivery_lat === 'number' && typeof row.delivery_lng === 'number') {
+            pts.push({ lat: row.delivery_lat, lng: row.delivery_lng });
+          }
+        }
+        deliveriesRef.current = pts;
+      };
+
+      void load();
+
+      channel = supabase
+        .channel(`driver-tracking-orders-${profileId}`)
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'orders',
+            filter: `assigned_driver_id=eq.${profileId}`,
+          },
+          () => { void load(); },
+        )
+        .subscribe();
+    })();
 
     return () => {
       cancelled = true;
-      supabase.removeChannel(ch);
+      if (channel) void supabase.removeChannel(channel);
     };
-  }, [profile]);
+  }, []);
 
-  async function toggleShift() {
-    if (!profile) return;
-    setShiftBusy(true);
-    const next = onShift ? 'offline' : 'available';
-    const { error } = await supabase.rpc('set_my_driver_status', { p_status: next });
-    if (error) toast.error(error.message);
-    else setOnShift(!onShift);
-    setShiftBusy(false);
-  }
+  // --- Restart the watcher when gpsMode changes (post thrash guard) ---
+  const didMountRef = useRef(false);
+  const restartingRef = useRef(false);
 
-  async function advance(orderId: string, nextStatus: string) {
-    setBusyOrderId(orderId);
-    const { error } = await supabase.rpc('advance_order_status', {
-      p_order_id: orderId,
-      p_next_status: nextStatus,
+  useEffect(() => {
+    if (!didMountRef.current) { didMountRef.current = true; return; }
+    if (restartingRef.current) return;
+    if (!watcherId.current) return;      // not tracking
+    if (!enabledRef.current) return;     // shift is off
+
+    restartingRef.current = true;
+    void (async () => {
+      try {
+        await stop();
+        if (!enabledRef.current) return;
+        await start();
+      } finally {
+        restartingRef.current = false;
+      }
+    })();
+  }, [gpsMode, start, stop]);
+
+  useEffect(() => {
+    const sub = Network.addListener('networkStatusChange', (s) => {
+      online.current = s.connected;
+      if (s.connected && enabled) void flush();
     });
-    if (error) {
-      console.error('Failed to advance order status', error);
-      toast.error(error.message);
-    } else {
-      toast.success('Order updated');
+    return () => { void sub.then((h) => h.remove()); };
+  }, [enabled, flush]);
+
+  useEffect(() => {
+    const on = () => { online.current = true; void flush(); };
+    const off = () => { online.current = false; };
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', off);
+    };
+  }, [flush]);
+
+  useEffect(() => { void readQueue().then((q) => setQueueSize(q.length)); }, [readQueue]);
+
+  useEffect(() => {
+    if (enabled && !watcherId.current) {
+      // Fresh shift: start at BALANCED and clear the thrash window so the
+      // first fix can settle the mode immediately.
+      modeRef.current = 'BALANCED';
+      modeConfigRef.current = MODE_CONFIG.BALANCED;
+      lastModeChangeRef.current = 0;
+      setGpsMode('BALANCED');
+      void start();
     }
-    setBusyOrderId(null);
-  }
+    if (!enabled && watcherId.current) {
+      void stop();
+      // Spec: off-shift is PASSIVE in the hook's state. computeMode() returns
+      // LOW in the (unreachable) case of a fix arriving with the shift off;
+      // PASSIVE is surfaced here for the UI.
+      modeRef.current = 'PASSIVE';
+      modeConfigRef.current = MODE_CONFIG.PASSIVE;
+      setGpsMode('PASSIVE');
+    }
+  }, [enabled, start, stop]);
 
-  if (!profile) return <div className="p-4">Loading…</div>;
-
-  return (
-    <div className="mx-auto max-w-2xl space-y-4 p-4">
-      <header className="flex items-center justify-between">
-        <div>
-          <h1 className="text-lg font-semibold">Driver shift</h1>
-          <p className="text-xs text-slate-500">
-            {isTracking ? 'Tracking active' : 'Tracking off'}
-            {lastSentAt && ` · last sent ${new Date(lastSentAt).toLocaleTimeString()}`}
-            {queueSize > 0 && ` · ${queueSize} queued`}
-          </p>
-        </div>
-        <button onClick={toggleShift} disabled={shiftBusy} className={`flex items-center gap-2 rounded px-4 py-2 text-sm font-medium text-white disabled:opacity-50 ${onShift ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
-          {onShift ? <><Square className="h-4 w-4" /> End shift</> : <><Play className="h-4 w-4" /> Start shift</>}
-        </button>
-      </header>
-
-      <div className="flex items-center gap-3 rounded border border-slate-200 bg-white px-3 py-2 text-xs">
-        {queueSize === 0
-          ? <><Wifi className="h-3.5 w-3.5 text-green-600" /> In sync</>
-          : <><WifiOff className="h-3.5 w-3.5 text-amber-600" /> {queueSize} fixes buffered <button className="underline" onClick={() => void flush()}>retry</button></>}
-        {lastError && <span className="ml-auto text-red-600">{lastError}</span>}
-      </div>
-
-      <section className="space-y-2">
-        <h2 className="text-sm font-medium text-slate-600">
-          Active deliveries
-          {activeOrders.length > 0 && <span className="ml-1 text-slate-400">({activeOrders.length})</span>}
-        </h2>
-
-        {activeOrders.length === 0 && <p className="text-sm text-slate-400">No active deliveries.</p>}
-
-        {activeOrders.map((o) => {
-          const action = nextActionFor(o.status);
-          const isBusy = busyOrderId === o.id;
-          const step = milestoneIndex(o.status);
-
-          return (
-            <div key={o.id} className="rounded border border-slate-200 bg-white p-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <div className="font-medium">{o.delivery_address}</div>
-                  <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
-                    <Truck className="h-3.5 w-3.5" />
-                    <span className="uppercase">{STATUS_LABEL[o.status] ?? o.status}</span>
-                    <span>·</span>
-                    <code className="rounded bg-slate-100 px-1">{o.tracking_code}</code>
-                  </div>
-                  <div className="mt-3 flex items-center gap-1">
-                    {MILESTONES.map((_, i) => (
-                      <div key={i} className={`h-1.5 flex-1 rounded ${i <= step ? 'bg-blue-600' : 'bg-slate-200'}`} />
-                    ))}
-                  </div>
-                  <div className="mt-1 flex justify-between text-[10px] uppercase tracking-wide text-slate-400">
-                    {MILESTONES.map((m) => <span key={m}>{MILESTONE_LABEL[m]}</span>)}
-                  </div>
-                </div>
-
-                {action && (
-                  <button onClick={() => advance(o.id, action.next)} disabled={isBusy} className={`flex shrink-0 items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${action.className}`}>
-                    {isBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <action.Icon className="h-3.5 w-3.5" />}
-                    {action.label}
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </section>
-    </div>
-  );
+  return { isTracking, queueSize, lastSentAt, lastError, gpsMode, start, stop, flush };
 }
