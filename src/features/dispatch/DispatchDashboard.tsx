@@ -1,9 +1,17 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import toast from 'react-hot-toast';
 import { supabase, type OrderRow, type Profile } from '../../lib/supabase';
 import { useProfile } from '../../lib/hooks/useProfile';
+import { MapWrapper } from '../../components/map/MapWrapper';
+import type { MapMarker } from '../../components/map/types';
 
 const ACTIVE_STATUSES = ['confirmed', 'dispatched', 'picked', 'in_transit'] as const;
+
+const DEFAULT_CENTER = { lat: 6.5244, lng: 3.3792 };
+const DEFAULT_ZOOM = 12;
+const STALE_MS = 2 * 60 * 1000;
+/** Tiny lat/lng offset applied when two drivers report identical coords. */
+const CO_LOCATION_OFFSET = 0.00005;
 
 export interface DriverLocation {
   driver_id: string;
@@ -19,6 +27,15 @@ interface LoadResult {
   orders: OrderRow[];
 }
 
+function computeTone(d: Profile, loc: DriverLocation): NonNullable<MapMarker['tone']> {
+  if (d.driver_status === 'available') return 'success';
+  if (d.driver_status === 'on_delivery') return 'primary';
+  const age = Date.now() - new Date(loc.updated_at).getTime();
+  if (age > STALE_MS) return 'muted';
+  // Remaining states (e.g. 'offline' with a fresh fix) are shown muted.
+  return 'muted';
+}
+
 export function DispatchDashboard() {
   const { profile, loading: profileLoading } = useProfile();
 
@@ -27,6 +44,7 @@ export function DispatchDashboard() {
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [panTo, setPanTo] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<LoadResult> => {
     if (!profile) {
@@ -117,6 +135,55 @@ export function DispatchDashboard() {
     };
   }, [profile, profileLoading, load]);
 
+  const markers = useMemo<MapMarker[]>(() => {
+    const out: MapMarker[] = [];
+    // Track coordinate use-counts so co-located drivers don't perfectly stack.
+    const coordCounts = new Map<string, number>();
+    for (const d of drivers) {
+      const loc = locations[d.id];
+      if (!loc) continue; // Never plot a driver with no location at (0, 0).
+
+      const key = `${loc.lat.toFixed(6)}|${loc.lng.toFixed(6)}`;
+      const idx = coordCounts.get(key) ?? 0;
+      coordCounts.set(key, idx + 1);
+
+      // If two drivers share the exact same coords, nudge each subsequent pin
+      // by ~0.00005° so the pins remain individually clickable.
+      const offset = idx * CO_LOCATION_OFFSET;
+
+      out.push({
+        id: d.id,
+        lat: loc.lat + offset,
+        lng: loc.lng + offset,
+        label: d.full_name ?? d.email,
+        tone: computeTone(d, loc),
+      });
+    }
+    return out;
+  }, [drivers, locations]);
+
+  const center = useMemo(() => {
+    if (markers.length === 0) return DEFAULT_CENTER;
+    let lat = 0;
+    let lng = 0;
+    for (const m of markers) {
+      lat += m.lat;
+      lng += m.lng;
+    }
+    return { lat: lat / markers.length, lng: lng / markers.length };
+  }, [markers]);
+
+  const focusDriver = useCallback((id: string) => {
+    // Toggle through null so repeat clicks on the same row still re-trigger
+    // the pan: FocusMarker only reacts when focusMarkerId actually changes.
+    setPanTo(null);
+    if (typeof window !== 'undefined') {
+      window.requestAnimationFrame(() => setPanTo(id));
+    } else {
+      setPanTo(id);
+    }
+  }, []);
+
   if (profileLoading || loading) {
     return <div className="p-6">Loading…</div>;
   }
@@ -139,9 +206,14 @@ export function DispatchDashboard() {
 
       <div className="grid gap-4 md:grid-cols-3">
         <div className="md:col-span-2">
-          <div className="rounded-lg border border-slate-200 bg-white h-96 flex items-center justify-center text-slate-400">
-            Map coming in next step
-          </div>
+          <MapWrapper
+            center={center}
+            zoom={DEFAULT_ZOOM}
+            markers={markers}
+            follow={false}
+            focusMarkerId={panTo}
+            className="h-96 w-full rounded-lg"
+          />
         </div>
 
         <div className="md:col-span-1">
@@ -151,7 +223,11 @@ export function DispatchDashboard() {
             </div>
             <ul className="divide-y divide-slate-100">
               {drivers.map((d) => (
-                <li key={d.id} className="px-3 py-2 text-sm">
+                <li
+                  key={d.id}
+                  className="px-3 py-2 text-sm"
+                  onClick={() => focusDriver(d.id)}
+                >
                   <div className="flex items-center justify-between gap-2">
                     <span className="truncate font-medium text-slate-800">
                       {d.full_name ?? d.email}
