@@ -8,6 +8,7 @@ import { OrderComposer } from './features/orders/OrderComposer';
 import { DriverShift } from './features/driver/DriverShift';
 import { BranchDashboard } from './features/dashboard/BranchDashboard';
 import { MasterDashboard } from './features/dashboard/MasterDashboard';
+import { DispatchDashboard } from './features/dispatch/DispatchDashboard';
 import { TrackOrder } from './features/tracking/TrackOrder';
 import { Login } from './features/auth/Login';
 import type { UserRole } from './lib/supabase';
@@ -64,6 +65,14 @@ export default function App() {
             element={
               <Gate allow={['branch_manager', 'fulfillment_officer', 'master']}>
                 <BranchDashboard />
+              </Gate>
+            }
+          />
+          <Route
+            path="/dispatch"
+            element={
+              <Gate allow={['master', 'branch_manager', 'fulfillment_officer']}>
+                <DispatchDashboard />
               </Gate>
             }
           />
