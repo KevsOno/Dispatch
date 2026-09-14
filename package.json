@@ -12,6 +12,7 @@
   "dependencies": {
     "@capacitor-community/background-geolocation": "^1.2.20",
     "@capacitor/core": "^6.1.2",
+    "@capacitor/device": "^6.0.2",
     "@capacitor/geolocation": "^6.0.1",
     "@capacitor/network": "^6.0.2",
     "@capacitor/preferences": "^6.0.2",
