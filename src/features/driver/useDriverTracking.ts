@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import { Device } from '@capacitor/device';
 import { Preferences } from '@capacitor/preferences';
 import { Network } from '@capacitor/network';
 import type {
@@ -16,6 +17,7 @@ const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('Backg
 const QUEUE_KEY = 'logiflow.gps.queue.v1';
 const MIN_INTERVAL_MS = 15_000;
 const MIN_DISTANCE_M  = 20;
+const BATTERY_CACHE_MS = 30_000;
 
 export interface QueuedFix {
   lat: number;
@@ -26,6 +28,55 @@ export interface QueuedFix {
 
 interface Options {
   enabled: boolean;
+}
+
+type BatteryReading = {
+  p_battery: number | null;
+  p_is_charging: boolean | null;
+};
+
+interface NavigatorBattery {
+  level: number;
+  charging: boolean;
+}
+interface NavigatorWithBattery extends Navigator {
+  getBattery?: () => Promise<NavigatorBattery>;
+}
+
+let batteryCache: { at: number; promise: Promise<BatteryReading> } | null = null;
+
+async function readBatteryNow(): Promise<BatteryReading> {
+  try {
+    if (Capacitor.isNativePlatform()) {
+      const info = await Device.getBatteryInfo();
+      return {
+        p_battery: Math.round(info.batteryLevel * 100),
+        p_is_charging: info.isCharging,
+      };
+    }
+    const nav = navigator as NavigatorWithBattery;
+    if (typeof nav.getBattery === 'function') {
+      const b = await nav.getBattery();
+      return {
+        p_battery: Math.round(b.level * 100),
+        p_is_charging: b.charging,
+      };
+    }
+    return { p_battery: null, p_is_charging: null };
+  } catch (err) {
+    console.error('Failed to read device battery', err);
+    return { p_battery: null, p_is_charging: null };
+  }
+}
+
+function getBatteryCached(): Promise<BatteryReading> {
+  const now = Date.now();
+  if (batteryCache && now - batteryCache.at < BATTERY_CACHE_MS) {
+    return batteryCache.promise;
+  }
+  const promise = readBatteryNow();
+  batteryCache = { at: now, promise };
+  return promise;
 }
 
 export function useDriverTracking({ enabled }: Options) {
@@ -69,10 +120,14 @@ export function useDriverTracking({ enabled }: Options) {
     if (q.length === 0) return;
     const newest = q.reduce((a, b) => (a.ts > b.ts ? a : b));
 
+    const battery = await getBatteryCached();
+
     const { error } = await supabase.rpc('upsert_driver_location', {
       p_lat: newest.lat,
       p_lng: newest.lng,
       p_accuracy: newest.accuracy,
+      p_battery: battery.p_battery,
+      p_is_charging: battery.p_is_charging,
     });
 
     if (error) { setLastError(error.message); return; }
@@ -94,10 +149,14 @@ export function useDriverTracking({ enabled }: Options) {
       return;
     }
 
+    const battery = await getBatteryCached();
+
     const { error } = await supabase.rpc('upsert_driver_location', {
       p_lat: fix.lat,
       p_lng: fix.lng,
       p_accuracy: fix.accuracy,
+      p_battery: battery.p_battery,
+      p_is_charging: battery.p_is_charging,
     });
 
     if (error) {
