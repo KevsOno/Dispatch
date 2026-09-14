@@ -324,24 +324,30 @@ export function useDriverTracking({ enabled }: Options) {
       const profileId = (profile as { id: string }).id;
 
       const load = async () => {
-        const { data, error } = await supabase
-          .from('orders')
-          .select('delivery_lat,delivery_lng')
-          .eq('assigned_driver_id', profileId)
-          .in('status', [...ACTIVE_ORDER_STATUSES]);
-        if (error) {
-          console.error('Failed to load active orders for GPS mode', error);
-          return;
-        }
-        if (cancelled) return;
-        const pts: DeliveryPoint[] = [];
-        for (const row of (data ?? []) as Array<{ delivery_lat: number | null; delivery_lng: number | null }>) {
-          if (typeof row.delivery_lat === 'number' && typeof row.delivery_lng === 'number') {
-            pts.push({ lat: row.delivery_lat, lng: row.delivery_lng });
-          }
-        }
-        deliveriesRef.current = pts;
-      };
+  // delivery_lat / delivery_lng are not currently part of the orders schema.
+  // We still fetch the row (select *) and probe client-side so that the
+  // moment those columns are added, the mode logic starts working without
+  // another code change -- and so we do not 400 on a missing column today.
+  const { data, error } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('assigned_driver_id', profileId)
+    .in('status', [...ACTIVE_ORDER_STATUSES]);
+  if (error) {
+    console.error('Failed to load active orders for GPS mode', error);
+    return;
+  }
+  if (cancelled) return;
+  const pts: DeliveryPoint[] = [];
+  for (const row of (data ?? []) as Array<Record<string, unknown>>) {
+    const lat = row.delivery_lat;
+    const lng = row.delivery_lng;
+    if (typeof lat === 'number' && typeof lng === 'number') {
+      pts.push({ lat, lng });
+    }
+  }
+  deliveriesRef.current = pts;
+};
 
       void load();
 
