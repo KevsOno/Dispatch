@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Capacitor, registerPlugin } from '@capacitor/core';
-import { Device } from '@capacitor/device';
 import { Preferences } from '@capacitor/preferences';
 import { Network } from '@capacitor/network';
+import { Battery } from '@capawesome/capacitor-battery';
 import type {
   BackgroundGeolocationPlugin,
   Location,
@@ -71,14 +71,11 @@ let batteryCache: { at: number; promise: Promise<BatteryReading> } | null = null
 async function readBatteryNow(): Promise<BatteryReading> {
   try {
     if (Capacitor.isNativePlatform()) {
-      const info = await Device.getBatteryInfo();
-      const level =
-        typeof info.batteryLevel === 'number'
-          ? Math.round(info.batteryLevel * 100)
-          : null;
-      const charging =
-        typeof info.isCharging === 'boolean' ? info.isCharging : null;
-      return { p_battery: level, p_is_charging: charging };
+      const info = await Battery.getBatteryInfo();
+      return {
+        p_battery: typeof info.level === 'number' ? Math.round(info.level * 100) : null,
+        p_is_charging: typeof info.isCharging === 'boolean' ? info.isCharging : null,
+      };
     }
     const nav = navigator as NavigatorWithBattery;
     if (typeof nav.getBattery === 'function') {
@@ -324,30 +321,30 @@ export function useDriverTracking({ enabled }: Options) {
       const profileId = (profile as { id: string }).id;
 
       const load = async () => {
-  // delivery_lat / delivery_lng are not currently part of the orders schema.
-  // We still fetch the row (select *) and probe client-side so that the
-  // moment those columns are added, the mode logic starts working without
-  // another code change -- and so we do not 400 on a missing column today.
-  const { data, error } = await supabase
-    .from('orders')
-    .select('*')
-    .eq('assigned_driver_id', profileId)
-    .in('status', [...ACTIVE_ORDER_STATUSES]);
-  if (error) {
-    console.error('Failed to load active orders for GPS mode', error);
-    return;
-  }
-  if (cancelled) return;
-  const pts: DeliveryPoint[] = [];
-  for (const row of (data ?? []) as Array<Record<string, unknown>>) {
-    const lat = row.delivery_lat;
-    const lng = row.delivery_lng;
-    if (typeof lat === 'number' && typeof lng === 'number') {
-      pts.push({ lat, lng });
-    }
-  }
-  deliveriesRef.current = pts;
-};
+        // delivery_lat / delivery_lng are not currently part of the orders schema.
+        // We still fetch the row (select *) and probe client-side so that the
+        // moment those columns are added, the mode logic starts working without
+        // another code change -- and so we do not 400 on a missing column today.
+        const { data, error } = await supabase
+          .from('orders')
+          .select('*')
+          .eq('assigned_driver_id', profileId)
+          .in('status', [...ACTIVE_ORDER_STATUSES]);
+        if (error) {
+          console.error('Failed to load active orders for GPS mode', error);
+          return;
+        }
+        if (cancelled) return;
+        const pts: DeliveryPoint[] = [];
+        for (const row of (data ?? []) as Array<Record<string, unknown>>) {
+          const lat = row.delivery_lat;
+          const lng = row.delivery_lng;
+          if (typeof lat === 'number' && typeof lng === 'number') {
+            pts.push({ lat, lng });
+          }
+        }
+        deliveriesRef.current = pts;
+      };
 
       void load();
 
