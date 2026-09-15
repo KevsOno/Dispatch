@@ -11,12 +11,24 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      VITE_SUPABASE_URL:      ${{ secrets.VITE_SUPABASE_URL }}
-      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-      VITE_GEOCODER:          ${{ vars.VITE_GEOCODER }}
-      VITE_MAPBOX_TOKEN:      ${{ secrets.VITE_MAPBOX_TOKEN }}
-      VITE_LOCATIONIQ_KEY:    ${{ secrets.VITE_LOCATIONIQ_KEY }}
-      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      # Core App Secrets
+      VITE_SUPABASE_URL:        ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY:   ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      VITE_GEOCODER:            ${{ vars.VITE_GEOCODER }}
+
+      # Geocoding & Mapping Providers (Legacy / Fallbacks)
+      VITE_MAPBOX_TOKEN:        ${{ secrets.VITE_MAPBOX_TOKEN }}
+      VITE_LOCATIONIQ_KEY:      ${{ secrets.VITE_LOCATIONIQ_KEY }}
+
+      # Amazon Location Service (New)
+      VITE_AWS_REGION:          ${{ vars.VITE_AWS_REGION || 'eu-west-1' }}
+      VITE_AWS_LOCATION_MAP:    ${{ vars.VITE_AWS_LOCATION_MAP || 'logiflow-map' }}
+      VITE_AWS_LOCATION_PLACES: ${{ vars.VITE_AWS_LOCATION_PLACES || 'logiflow-places' }}
+      VITE_AWS_LOCATION_ROUTES: ${{ vars.VITE_AWS_LOCATION_ROUTES || 'logiflow-routes' }}
+      VITE_AWS_LOCATION_API_KEY: ${{ secrets.VITE_AWS_LOCATION_API_KEY }}
+
+      # Android Signing
+      ANDROID_KEYSTORE_BASE64:  ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
     steps:
       - name: Checkout
@@ -40,6 +52,22 @@ jobs:
 
       - name: Install dependencies
         run: npm install
+
+      - name: Configure Capacitor Hostname for AWS API Key
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = "capacitor.config.json";
+            let config = {};
+            if (fs.existsSync(file)) {
+              config = JSON.parse(fs.readFileSync(file, "utf8"));
+            }
+            config.server = config.server || {};
+            config.server.hostname = "dispflow.netlify.app";
+            config.server.androidScheme = "https";
+            config.server.iosScheme = "https";
+            fs.writeFileSync(file, JSON.stringify(config, null, 2));
+          '
 
       - name: Build web app
         run: npm run build
