@@ -10,7 +10,6 @@
     "cap:open": "cap open android"
   },
   "dependencies": {
-    "@capawesome/capacitor-device-info": "^6.0.0",
     "@capacitor-community/background-geolocation": "^1.2.20",
     "@capacitor/core": "^6.1.2",
     "@capacitor/device": "^6.0.2",
