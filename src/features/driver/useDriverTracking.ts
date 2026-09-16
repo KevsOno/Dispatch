@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Preferences } from '@capacitor/preferences';
 import { Network } from '@capacitor/network';
-import { Battery } from '@capawesome/capacitor-battery';
+import { Battery } from '@capawesome-team/capacitor-battery';
 import type {
   BackgroundGeolocationPlugin,
   Location,
@@ -72,11 +72,20 @@ async function readBatteryNow(): Promise<BatteryReading> {
   try {
     if (Capacitor.isNativePlatform()) {
       const info = await Battery.getBatteryInfo();
+
+      // Capawesome returns batteryLevel as a number between 0 and 1 on iOS/Android
+      // e.g., 0.85 = 85%
+      const level = typeof info.batteryLevel === 'number'
+        ? Math.round(info.batteryLevel * 100)
+        : null;
+
       return {
-        p_battery: typeof info.level === 'number' ? Math.round(info.level * 100) : null,
+        p_battery: level,
         p_is_charging: typeof info.isCharging === 'boolean' ? info.isCharging : null,
       };
     }
+
+    // Fallback for Web/Browser mode
     const nav = navigator as NavigatorWithBattery;
     if (typeof nav.getBattery === 'function') {
       const b = await nav.getBattery();
@@ -85,12 +94,14 @@ async function readBatteryNow(): Promise<BatteryReading> {
         p_is_charging: b.charging,
       };
     }
+
     return { p_battery: null, p_is_charging: null };
   } catch (err) {
     console.error('Failed to read device battery', err);
     return { p_battery: null, p_is_charging: null };
   }
 }
+
 function getBatteryCached(): Promise<BatteryReading> {
   const now = Date.now();
   if (batteryCache && now - batteryCache.at < BATTERY_CACHE_MS) {
