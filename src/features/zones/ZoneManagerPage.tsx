@@ -16,6 +16,7 @@ interface Geofence {
 }
 
 const SYNC_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/sync-geofence`;
+const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
 export function ZoneManagerPage() {
   const { profile } = useProfile();
@@ -94,7 +95,10 @@ export function ZoneManagerPage() {
       // Mirror to AWS. Failure is non-blocking — the zone still exists locally.
       const res = await fetch(SYNC_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: ANON_KEY,
+        },
         body: JSON.stringify({ geofence_id: rowId, action: 'upsert' }),
       });
 
@@ -120,7 +124,10 @@ export function ZoneManagerPage() {
     if (g.aws_geofence_id) {
       await fetch(SYNC_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: ANON_KEY,
+        },
         body: JSON.stringify({ geofence_id: g.id, action: 'delete' }),
       });
     }
@@ -238,7 +245,7 @@ export function ZoneManagerPage() {
             </div>
 
             <p className="mb-2 text-xs text-slate-500">
-              Click the polygon tool, then click on the map to place corners. Click the first point again to close the shape.
+              Click on the map to add corners. Click the first point again (or press Enter) to close the polygon. Press Escape to cancel.
             </p>
 
             <MapLibreMap
