@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react';
 import maplibregl, { Map as MLMap, Marker as MLMarker } from 'maplibre-gl';
-import MapboxDraw from '@maplibre/maplibre-gl-draw';
+import { Geoman } from '@geoman-io/maplibre-geoman-free';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import '@maplibre/maplibre-gl-draw/dist/mapbox-gl-draw.css';
+import '@geoman-io/maplibre-geoman-free/dist/maplibre-geoman.css';
 import type { MapWrapperProps, MapMarker } from './types';
 
 const TONE_COLORS: Record<NonNullable<MapMarker['tone']>, string> = {
@@ -36,7 +36,6 @@ interface GeofencePolygon {
 interface ExtendedProps extends MapWrapperProps {
   drawMode?: boolean;
   onPolygonComplete?: (polygon: GeoJSON.Polygon) => void;
-  /** Geofences to render as filled polygons. */
   geofences?: GeofencePolygon[];
 }
 
@@ -58,7 +57,7 @@ export function MapLibreMap({
 }: ExtendedProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MLMap | null>(null);
-  const drawRef = useRef<MapboxDraw | null>(null);
+  const geomanRef = useRef<Geoman | null>(null);
   const markersRef = useRef<
     Map<string, { marker: MLMarker; tone: NonNullable<MapMarker['tone']>; label?: string }>
   >(new Map());
@@ -78,58 +77,44 @@ export function MapLibreMap({
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     mapRef.current = map;
 
+    // Attach Geoman. We create it once and toggle draw mode via events.
+    const geoman = new Geoman(map);
+    geomanRef.current = geoman;
+
+    // When a polygon is drawn, emit the geometry to the parent.
+    map.on('gm:create', (e: any) => {
+      const feature = e.feature;
+      if (!feature || feature.geometry.type !== 'Polygon') return;
+      // Remove any previously drawn shape so we keep a single polygon.
+      const all = geoman.features.getAll?.();
+      if (all?.features) {
+        for (const f of all.features) {
+          geoman.features.delete(f);
+        }
+      }
+      onPolygonComplete?.(feature.geometry as GeoJSON.Polygon);
+    });
+
     return () => {
       map.remove();
       mapRef.current = null;
+      geomanRef.current = null;
       markersRef.current.clear();
-      drawRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Draw mode ──
+  // ── Toggle draw mode ──
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
+    const geoman = geomanRef.current;
+    if (!geoman) return;
 
-    if (!drawMode) {
-      if (drawRef.current) {
-        map.removeControl(drawRef.current);
-        drawRef.current = null;
-      }
-      return;
+    if (drawMode) {
+      geoman.enableDraw();
+    } else {
+      geoman.disableDraw();
     }
-
-    if (drawRef.current) return;
-
-    const draw = new MapboxDraw({
-      displayControlsDefault: false,
-      controls: { polygon: true, trash: true },
-      defaultMode: 'draw_polygon',
-    });
-    map.addControl(draw, 'top-left');
-    drawRef.current = draw;
-
-    const handleCreate = () => {
-      const data = draw.getAll();
-      if (data.features.length === 0) return;
-      const f = data.features[data.features.length - 1];
-      if (f.geometry.type !== 'Polygon') return;
-      // Clear previous shapes so only one polygon is on the map at a time.
-      const ids = data.features.map((ft) => ft.id).filter(Boolean) as string[];
-      for (const id of ids) draw.delete(id);
-      draw.add(f);
-      onPolygonComplete?.(f.geometry as GeoJSON.Polygon);
-    };
-
-    map.on('draw.create', handleCreate);
-    map.on('draw.update', handleCreate);
-
-    return () => {
-      map.off('draw.create', handleCreate);
-      map.off('draw.update', handleCreate);
-    };
-  }, [drawMode, onPolygonComplete]);
+  }, [drawMode]);
 
   // ── Viewport reporter ──
   useEffect(() => {
