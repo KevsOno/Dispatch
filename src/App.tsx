@@ -9,6 +9,7 @@ import { DriverShift } from './features/driver/DriverShift';
 import { BranchDashboard } from './features/dashboard/BranchDashboard';
 import { MasterDashboard } from './features/dashboard/MasterDashboard';
 import { DispatchDashboard } from './features/dispatch/DispatchDashboard';
+import { ZoneManagerPage } from './features/zones/ZoneManagerPage';
 import { TrackOrder } from './features/tracking/TrackOrder';
 import { Login } from './features/auth/Login';
 import type { UserRole } from './lib/supabase';
@@ -73,6 +74,14 @@ export default function App() {
             element={
               <Gate allow={['master', 'branch_manager', 'fulfillment_officer']}>
                 <DispatchDashboard />
+              </Gate>
+            }
+          />
+          <Route
+            path="/zones"
+            element={
+              <Gate allow={['master', 'branch_manager', 'fulfillment_officer']}>
+                <ZoneManagerPage />
               </Gate>
             }
           />
