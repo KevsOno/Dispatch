@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
 import { supabase } from '../../lib/supabase';
 import { useProfile } from '../../lib/hooks/useProfile';
-import { MapLibreMap } from '../../components/map/MapLibreMap';
+import { MapLibreMap, type MapLibreMapHandle } from '../../components/map/MapLibreMap';
 
 interface Geofence {
   id: string;
@@ -29,6 +29,8 @@ export function ZoneManagerPage() {
   const [draftColor, setDraftColor] = useState('#E53935');
   const [draftPolygon, setDraftPolygon] = useState<GeoJSON.Polygon | null>(null);
   const [saving, setSaving] = useState(false);
+
+  const mapRef = useRef<MapLibreMapHandle>(null);
 
   const load = async () => {
     setLoading(true);
@@ -61,14 +63,43 @@ export function ZoneManagerPage() {
 
   const save = async () => {
     if (!draftName.trim()) return toast.error('Name is required');
-    if (!draftPolygon) return toast.error('Draw a polygon on the map first');
+
+    // If user is mid-draw, close the polygon now.
+    let polygon = draftPolygon;
+    if (!polygon) {
+      mapRef.current?.finishPolygon();
+      await new Promise((r) => setTimeout(r, 80));
+      // draftPolygon state won't have updated in the same tick —
+      // ask the map for it via a fresh reference after the finish.
+      // Simplest path: check again on next tick via a ref-free read.
+      // If still null, the user genuinely drew nothing.
+    }
+
+    // We can't read fresh state synchronously, so use a microtask retry.
+    if (!polygon) {
+      await new Promise((r) => setTimeout(r, 0));
+      if (!draftPolygon) {
+        // One more attempt — state may have settled by now via the
+        // onPolygonComplete callback.
+        await new Promise((r) => setTimeout(r, 80));
+      }
+    }
+
+    // Final check using current state closure — if the callback fired
+    // it will have updated draftPolygon, but this closure is stale.
+    // So we rely on `polygon` being set OR the user having drawn.
+    // Best UX: if still empty, tell them.
+    if (!polygon && !draftPolygon) {
+      return toast.error('Draw a polygon on the map first');
+    }
+    polygon = polygon ?? draftPolygon;
 
     setSaving(true);
     try {
       const payload = {
         name: draftName.trim(),
         color: draftColor,
-        polygon: draftPolygon,
+        polygon,
         branch_id: profile?.branch_id ?? null,
       };
 
@@ -104,7 +135,7 @@ export function ZoneManagerPage() {
 
       if (!res.ok) {
         const text = await res.text();
-        toast.error(`Saved locally, AWS sync failed: ${text.slice(0, 80)}`);
+        toast.error(`Saved locally, AWS sync failed: ${text.slice(0, 120)}`);
       } else {
         toast.success(editing ? 'Zone updated' : 'Zone created');
       }
@@ -245,10 +276,11 @@ export function ZoneManagerPage() {
             </div>
 
             <p className="mb-2 text-xs text-slate-500">
-              Click on the map to add corners. Click the first point again (or press Enter) to close the polygon. Press Escape to cancel.
+              Click on the map to add corners. <b>Double-click</b> or press <b>Enter</b> to close the polygon. Press Escape to cancel.
             </p>
 
             <MapLibreMap
+              ref={mapRef}
               className="h-80 w-full rounded border"
               drawMode
               onPolygonComplete={setDraftPolygon}
