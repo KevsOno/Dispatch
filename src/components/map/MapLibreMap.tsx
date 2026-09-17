@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
 import maplibregl, { Map as MLMap, Marker as MLMarker } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import type { MapWrapperProps, MapMarker } from './types';
@@ -31,6 +31,13 @@ interface GeofencePolygon {
   color: string;
 }
 
+export interface MapLibreMapHandle {
+  /** Close the in-progress polygon and fire onPolygonComplete. */
+  finishPolygon: () => void;
+  /** Discard the in-progress polygon. */
+  cancelPolygon: () => void;
+}
+
 interface ExtendedProps extends MapWrapperProps {
   drawMode?: boolean;
   onPolygonComplete?: (polygon: GeoJSON.Polygon) => void;
@@ -44,35 +51,44 @@ const STYLE_URL =
 const DRAW_SOURCE = 'draw-source';
 const DRAW_LINE = 'draw-line';
 const DRAW_POINTS = 'draw-points';
-const CLOSE_DISTANCE_PX = 12;
+const CLOSE_DISTANCE_PX = 20;
 
-export function MapLibreMap({
-  center = { lat: 6.5244, lng: 3.3792 },
-  zoom = 12,
-  markers = [],
-  className = 'h-96 w-full rounded-lg',
-  follow = true,
-  focusMarkerId = null,
-  onViewportChange,
-  drawMode = false,
-  onPolygonComplete,
-  geofences = [],
-}: ExtendedProps) {
+export const MapLibreMap = forwardRef<MapLibreMapHandle, ExtendedProps>(function MapLibreMap(
+  {
+    center = { lat: 6.5244, lng: 3.3792 },
+    zoom = 12,
+    markers = [],
+    className = 'h-96 w-full rounded-lg',
+    follow = true,
+    focusMarkerId = null,
+    onViewportChange,
+    drawMode = false,
+    onPolygonComplete,
+    geofences = [],
+  },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MLMap | null>(null);
   const markersRef = useRef<
     Map<string, { marker: MLMarker; tone: NonNullable<MapMarker['tone']>; label?: string }>
   >(new Map());
 
-  // Drawing state
-  const verticesRef = useRef<[number, number][]>([]); // [lng, lat][]
+  const verticesRef = useRef<[number, number][]>([]);
   const onPolygonCompleteRef = useRef(onPolygonComplete);
   useEffect(() => { onPolygonCompleteRef.current = onPolygonComplete; }, [onPolygonComplete]);
 
   const drawModeRef = useRef(drawMode);
   useEffect(() => { drawModeRef.current = drawMode; }, [drawMode]);
 
-  // ── Init map ──
+  const finishPolygonRef = useRef<() => void>(() => {});
+  const cancelPolygonRef = useRef<() => void>(() => {});
+
+  useImperativeHandle(ref, () => ({
+    finishPolygon: () => finishPolygonRef.current(),
+    cancelPolygon: () => cancelPolygonRef.current(),
+  }), []);
+
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
@@ -90,7 +106,6 @@ export function MapLibreMap({
     const renderDraw = () => {
       const vertices = verticesRef.current;
       const features: GeoJSON.Feature[] = [];
-
       if (vertices.length > 0) {
         features.push({
           type: 'Feature',
@@ -105,12 +120,9 @@ export function MapLibreMap({
           });
         }
       }
-
       const fc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features };
       const src = map.getSource(DRAW_SOURCE) as maplibregl.GeoJSONSource | undefined;
-      if (src) {
-        src.setData(fc as GeoJSON.FeatureCollection<GeoJSON.Geometry>);
-      }
+      if (src) src.setData(fc as GeoJSON.FeatureCollection<GeoJSON.Geometry>);
     };
 
     const ensureDrawLayers = () => {
@@ -126,11 +138,7 @@ export function MapLibreMap({
           type: 'line',
           source: DRAW_SOURCE,
           filter: ['==', '$type', 'LineString'],
-          paint: {
-            'line-color': '#111827',
-            'line-width': 2,
-            'line-dasharray': [2, 2],
-          },
+          paint: { 'line-color': '#111827', 'line-width': 2, 'line-dasharray': [2, 2] },
         });
       }
       if (!map.getLayer(DRAW_POINTS)) {
@@ -149,27 +157,6 @@ export function MapLibreMap({
       }
     };
 
-    const onMapClick = (e: maplibregl.MapMouseEvent) => {
-      if (!drawModeRef.current) return;
-      const coord: [number, number] = [e.lngLat.lng, e.lngLat.lat];
-      const vertices = verticesRef.current;
-
-      // If we already have ≥3 points and clicked near the first point, close the polygon.
-      if (vertices.length >= 3) {
-        const first = vertices[0];
-        const firstPt = map.project(first);
-        const dx = firstPt.x - e.point.x;
-        const dy = firstPt.y - e.point.y;
-        if (Math.sqrt(dx * dx + dy * dy) <= CLOSE_DISTANCE_PX) {
-          finishPolygon();
-          return;
-        }
-      }
-
-      vertices.push(coord);
-      renderDraw();
-    };
-
     const finishPolygon = () => {
       const vertices = verticesRef.current;
       if (vertices.length < 3) {
@@ -177,31 +164,57 @@ export function MapLibreMap({
         renderDraw();
         return;
       }
-      // GeoJSON polygons must close the ring
       const ring = [...vertices, vertices[0]];
-      const polygon: GeoJSON.Polygon = {
-        type: 'Polygon',
-        coordinates: [ring],
-      };
+      const polygon: GeoJSON.Polygon = { type: 'Polygon', coordinates: [ring] };
       verticesRef.current = [];
       renderDraw();
       onPolygonCompleteRef.current?.(polygon);
     };
 
+    const cancelPolygon = () => {
+      verticesRef.current = [];
+      renderDraw();
+    };
+
+    finishPolygonRef.current = finishPolygon;
+    cancelPolygonRef.current = cancelPolygon;
+
+    // Add a vertex on single-click
+    const onMapClick = (e: maplibregl.MapMouseEvent) => {
+      if (!drawModeRef.current) return;
+      const coord: [number, number] = [e.lngLat.lng, e.lngLat.lat];
+      const vertices = verticesRef.current;
+
+      // Close if clicked near the first vertex
+      if (vertices.length >= 3) {
+        const firstPt = map.project(vertices[0]);
+        const dx = firstPt.x - e.point.x;
+        const dy = firstPt.y - e.point.y;
+        if (Math.sqrt(dx * dx + dy * dy) <= CLOSE_DISTANCE_PX) {
+          finishPolygon();
+          return;
+        }
+      }
+      vertices.push(coord);
+      renderDraw();
+    };
+
+    // Double-click also finishes
+    const onMapDblClick = (e: maplibregl.MapMouseEvent) => {
+      if (!drawModeRef.current) return;
+      e.preventDefault();
+      finishPolygon();
+    };
+
     const onKeyDown = (e: KeyboardEvent) => {
       if (!drawModeRef.current) return;
-      if (e.key === 'Enter') {
-        finishPolygon();
-      } else if (e.key === 'Escape') {
-        verticesRef.current = [];
-        renderDraw();
-      }
+      if (e.key === 'Enter') finishPolygon();
+      else if (e.key === 'Escape') cancelPolygon();
     };
 
     map.on('click', onMapClick);
-    map.once('load', () => {
-      ensureDrawLayers();
-    });
+    map.on('dblclick', onMapDblClick);
+    map.once('load', ensureDrawLayers);
     window.addEventListener('keydown', onKeyDown);
 
     return () => {
@@ -213,7 +226,7 @@ export function MapLibreMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Toggle draw cursor ──
+  // Toggle draw cursor
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -221,13 +234,11 @@ export function MapLibreMap({
     if (!drawMode) {
       verticesRef.current = [];
       const src = map.getSource(DRAW_SOURCE) as maplibregl.GeoJSONSource | undefined;
-      if (src) {
-        src.setData({ type: 'FeatureCollection', features: [] });
-      }
+      if (src) src.setData({ type: 'FeatureCollection', features: [] });
     }
   }, [drawMode]);
 
-  // ── Viewport reporter ──
+  // Viewport reporter
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !onViewportChange) return;
@@ -239,18 +250,17 @@ export function MapLibreMap({
     return () => { map.off('moveend', handler); };
   }, [onViewportChange]);
 
-  // ── Follow center ──
+  // Follow center
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !follow) return;
     map.easeTo({ center: [center.lng, center.lat], zoom, duration: 500 });
   }, [center.lat, center.lng, zoom, follow]);
 
-  // ── Geofence polygons ──
+  // Geofence polygons
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-
     const sourceId = 'geofences-source';
     const fillId = 'geofences-fill';
     const lineId = 'geofences-line';
@@ -265,48 +275,34 @@ export function MapLibreMap({
           geometry: g.polygon,
         })),
       };
-
       const existing = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
       if (existing) {
         existing.setData(fc as GeoJSON.FeatureCollection<GeoJSON.Geometry>);
       } else {
         map.addSource(sourceId, { type: 'geojson', data: fc });
         map.addLayer({
-          id: fillId,
-          type: 'fill',
-          source: sourceId,
-          paint: {
-            'fill-color': ['get', 'color'],
-            'fill-opacity': 0.15,
-          },
+          id: fillId, type: 'fill', source: sourceId,
+          paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.15 },
         });
         map.addLayer({
-          id: lineId,
-          type: 'line',
-          source: sourceId,
-          paint: {
-            'line-color': ['get', 'color'],
-            'line-width': 2,
-          },
+          id: lineId, type: 'line', source: sourceId,
+          paint: { 'line-color': ['get', 'color'], 'line-width': 2 },
         });
       }
     };
-
     if (map.isStyleLoaded()) apply();
     else map.once('load', apply);
   }, [geofences]);
 
-  // ── Markers ──
+  // Markers
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-
     const seen = new Set<string>();
     for (const m of markers) {
       seen.add(m.id);
       const tone = m.tone ?? 'primary';
       const existing = markersRef.current.get(m.id);
-
       if (existing) {
         existing.marker.setLngLat([m.lng, m.lat]);
         if (existing.tone !== tone) {
@@ -331,7 +327,6 @@ export function MapLibreMap({
         markersRef.current.set(m.id, { marker, tone, label: m.label });
       }
     }
-
     for (const [id, entry] of markersRef.current) {
       if (!seen.has(id)) {
         entry.marker.remove();
@@ -340,7 +335,7 @@ export function MapLibreMap({
     }
   }, [markers]);
 
-  // ── Focus a marker ──
+  // Focus marker
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !focusMarkerId) return;
@@ -350,4 +345,4 @@ export function MapLibreMap({
   }, [focusMarkerId, markers, zoom]);
 
   return <div ref={containerRef} className={className} />;
-}
+});
