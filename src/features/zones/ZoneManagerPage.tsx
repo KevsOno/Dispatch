@@ -238,7 +238,7 @@ export function ZoneManagerPage() {
             </div>
 
             <p className="mb-2 text-xs text-slate-500">
-              Use the polygon tool (top-left of the map) to draw the zone. Double-click to finish.
+              Click the polygon tool, then click on the map to place corners. Click the first point again to close the shape.
             </p>
 
             <MapLibreMap
