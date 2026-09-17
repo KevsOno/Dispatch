@@ -1,8 +1,6 @@
 import { useEffect, useRef } from 'react';
 import maplibregl, { Map as MLMap, Marker as MLMarker } from 'maplibre-gl';
-import { Geoman } from '@geoman-io/maplibre-geoman-free';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import '@geoman-io/maplibre-geoman-free/dist/maplibre-geoman.css';
 import type { MapWrapperProps, MapMarker } from './types';
 
 const TONE_COLORS: Record<NonNullable<MapMarker['tone']>, string> = {
@@ -43,6 +41,11 @@ const STYLE_URL =
   (import.meta.env.VITE_MAP_STYLE_URL as string | undefined) ??
   'https://demotiles.maplibre.org/style.json';
 
+const DRAW_SOURCE = 'draw-source';
+const DRAW_LINE = 'draw-line';
+const DRAW_POINTS = 'draw-points';
+const CLOSE_DISTANCE_PX = 12;
+
 export function MapLibreMap({
   center = { lat: 6.5244, lng: 3.3792 },
   zoom = 12,
@@ -57,12 +60,19 @@ export function MapLibreMap({
 }: ExtendedProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MLMap | null>(null);
-  const geomanRef = useRef<Geoman | null>(null);
   const markersRef = useRef<
     Map<string, { marker: MLMarker; tone: NonNullable<MapMarker['tone']>; label?: string }>
   >(new Map());
 
-  // ── Init map once ──
+  // Drawing state
+  const verticesRef = useRef<[number, number][]>([]); // [lng, lat][]
+  const onPolygonCompleteRef = useRef(onPolygonComplete);
+  useEffect(() => { onPolygonCompleteRef.current = onPolygonComplete; }, [onPolygonComplete]);
+
+  const drawModeRef = useRef(drawMode);
+  useEffect(() => { drawModeRef.current = drawMode; }, [drawMode]);
+
+  // ── Init map ──
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
@@ -77,42 +87,143 @@ export function MapLibreMap({
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     mapRef.current = map;
 
-    // Attach Geoman. We create it once and toggle draw mode via events.
-    const geoman = new Geoman(map);
-    geomanRef.current = geoman;
+    const renderDraw = () => {
+      const vertices = verticesRef.current;
+      const features: GeoJSON.Feature[] = [];
 
-    // When a polygon is drawn, emit the geometry to the parent.
-    map.on('gm:create', (e: any) => {
-      const feature = e.feature;
-      if (!feature || feature.geometry.type !== 'Polygon') return;
-      // Remove any previously drawn shape so we keep a single polygon.
-      const all = geoman.features.getAll?.();
-      if (all?.features) {
-        for (const f of all.features) {
-          geoman.features.delete(f);
+      if (vertices.length > 0) {
+        features.push({
+          type: 'Feature',
+          properties: {},
+          geometry: { type: 'LineString', coordinates: vertices },
+        });
+        for (const coord of vertices) {
+          features.push({
+            type: 'Feature',
+            properties: {},
+            geometry: { type: 'Point', coordinates: coord },
+          });
         }
       }
-      onPolygonComplete?.(feature.geometry as GeoJSON.Polygon);
+
+      const fc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features };
+      const src = map.getSource(DRAW_SOURCE) as maplibregl.GeoJSONSource | undefined;
+      if (src) {
+        src.setData(fc as GeoJSON.FeatureCollection<GeoJSON.Geometry>);
+      }
+    };
+
+    const ensureDrawLayers = () => {
+      if (!map.getSource(DRAW_SOURCE)) {
+        map.addSource(DRAW_SOURCE, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        });
+      }
+      if (!map.getLayer(DRAW_LINE)) {
+        map.addLayer({
+          id: DRAW_LINE,
+          type: 'line',
+          source: DRAW_SOURCE,
+          filter: ['==', '$type', 'LineString'],
+          paint: {
+            'line-color': '#111827',
+            'line-width': 2,
+            'line-dasharray': [2, 2],
+          },
+        });
+      }
+      if (!map.getLayer(DRAW_POINTS)) {
+        map.addLayer({
+          id: DRAW_POINTS,
+          type: 'circle',
+          source: DRAW_SOURCE,
+          filter: ['==', '$type', 'Point'],
+          paint: {
+            'circle-radius': 5,
+            'circle-color': '#111827',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#ffffff',
+          },
+        });
+      }
+    };
+
+    const onMapClick = (e: maplibregl.MapMouseEvent) => {
+      if (!drawModeRef.current) return;
+      const coord: [number, number] = [e.lngLat.lng, e.lngLat.lat];
+      const vertices = verticesRef.current;
+
+      // If we already have ≥3 points and clicked near the first point, close the polygon.
+      if (vertices.length >= 3) {
+        const first = vertices[0];
+        const firstPt = map.project(first);
+        const dx = firstPt.x - e.point.x;
+        const dy = firstPt.y - e.point.y;
+        if (Math.sqrt(dx * dx + dy * dy) <= CLOSE_DISTANCE_PX) {
+          finishPolygon();
+          return;
+        }
+      }
+
+      vertices.push(coord);
+      renderDraw();
+    };
+
+    const finishPolygon = () => {
+      const vertices = verticesRef.current;
+      if (vertices.length < 3) {
+        verticesRef.current = [];
+        renderDraw();
+        return;
+      }
+      // GeoJSON polygons must close the ring
+      const ring = [...vertices, vertices[0]];
+      const polygon: GeoJSON.Polygon = {
+        type: 'Polygon',
+        coordinates: [ring],
+      };
+      verticesRef.current = [];
+      renderDraw();
+      onPolygonCompleteRef.current?.(polygon);
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!drawModeRef.current) return;
+      if (e.key === 'Enter') {
+        finishPolygon();
+      } else if (e.key === 'Escape') {
+        verticesRef.current = [];
+        renderDraw();
+      }
+    };
+
+    map.on('click', onMapClick);
+    map.once('load', () => {
+      ensureDrawLayers();
     });
+    window.addEventListener('keydown', onKeyDown);
 
     return () => {
+      window.removeEventListener('keydown', onKeyDown);
       map.remove();
       mapRef.current = null;
-      geomanRef.current = null;
       markersRef.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Toggle draw mode ──
+  // ── Toggle draw cursor ──
   useEffect(() => {
-    const geoman = geomanRef.current;
-    if (!geoman) return;
-
-    if (drawMode) {
-      geoman.enableDraw();
-    } else {
-      geoman.disableDraw();
+    const map = mapRef.current;
+    if (!map) return;
+    map.getCanvas().style.cursor = drawMode ? 'crosshair' : '';
+    if (!drawMode) {
+      verticesRef.current = [];
+      const src = map.getSource(DRAW_SOURCE) as maplibregl.GeoJSONSource | undefined;
+      if (src) {
+        src.setData({ type: 'FeatureCollection', features: [] });
+      }
     }
   }, [drawMode]);
 
