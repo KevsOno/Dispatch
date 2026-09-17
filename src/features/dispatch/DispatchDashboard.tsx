@@ -15,6 +15,7 @@ import { useProfile } from '../../lib/hooks/useProfile';
 import { haversineMeters } from '../../lib/geo';
 import { MapWrapper } from '../../components/map/MapWrapper';
 import type { MapMarker } from '../../components/map/types';
+import { GeofenceAlertsPanel } from './GeofenceAlertsPanel';
 
 const ACTIVE_STATUSES = ['confirmed', 'dispatched', 'picked', 'in_transit'] as const;
 
@@ -414,7 +415,7 @@ export function DispatchDashboard() {
           />
         </div>
 
-        <div className="md:col-span-1">
+        <div className="md:col-span-1 space-y-4">
           <div className="rounded-lg border border-slate-200 bg-white">
             <div className="border-b border-slate-200 px-3 py-2 text-sm font-medium text-slate-600">
               Drivers
@@ -496,6 +497,8 @@ export function DispatchDashboard() {
               </ul>
             )}
           </div>
+
+          <GeofenceAlertsPanel />
         </div>
       </div>
     </div>
