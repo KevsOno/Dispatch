@@ -10,8 +10,6 @@ interface Geofence {
   description: string | null;
   polygon: GeoJSON.Polygon;
   color: string;
-  fee: number;
-  kind: 'coverage' | 'alert';
   aws_geofence_id: string | null;
   is_active: boolean;
   created_at: string;
@@ -28,8 +26,6 @@ export function ZoneManagerPage() {
 
   const [draftName, setDraftName] = useState('');
   const [draftColor, setDraftColor] = useState('#E53935');
-  const [draftFee, setDraftFee] = useState(0);
-  const [draftKind, setDraftKind] = useState<'coverage' | 'alert'>('coverage');
   const [draftPolygon, setDraftPolygon] = useState<GeoJSON.Polygon | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -50,8 +46,6 @@ export function ZoneManagerPage() {
     setEditing(null);
     setDraftName('');
     setDraftColor('#E53935');
-    setDraftFee(0);
-    setDraftKind('coverage');
     setDraftPolygon(null);
     setShowModal(true);
   };
@@ -60,8 +54,6 @@ export function ZoneManagerPage() {
     setEditing(g);
     setDraftName(g.name);
     setDraftColor(g.color);
-    setDraftFee(g.fee);
-    setDraftKind(g.kind);
     setDraftPolygon(g.polygon);
     setShowModal(true);
   };
@@ -75,8 +67,6 @@ export function ZoneManagerPage() {
       const payload = {
         name: draftName.trim(),
         color: draftColor,
-        fee: draftFee,
-        kind: draftKind,
         polygon: draftPolygon,
         branch_id: profile?.branch_id ?? null,
       };
@@ -101,15 +91,16 @@ export function ZoneManagerPage() {
         rowId = data.id;
       }
 
-      // Mirror to AWS — non-blocking failure, log the error but don't block UI
+      // Mirror to AWS. Failure is non-blocking — the zone still exists locally.
       const res = await fetch(SYNC_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ geofence_id: rowId, action: 'upsert' }),
       });
+
       if (!res.ok) {
         const text = await res.text();
-        toast.error(`Saved locally, but AWS sync failed: ${text.slice(0, 80)}`);
+        toast.error(`Saved locally, AWS sync failed: ${text.slice(0, 80)}`);
       } else {
         toast.success(editing ? 'Zone updated' : 'Zone created');
       }
@@ -143,7 +134,7 @@ export function ZoneManagerPage() {
   return (
     <div className="mx-auto max-w-6xl space-y-4 p-4">
       <header className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Delivery Zones</h1>
+        <h1 className="text-xl font-semibold">Watch Zones</h1>
         <button
           onClick={openNew}
           className="rounded bg-slate-900 px-3 py-1.5 text-sm text-white"
@@ -151,6 +142,10 @@ export function ZoneManagerPage() {
           + Add Zone
         </button>
       </header>
+
+      <p className="text-sm text-slate-500">
+        Zones are used to alert dispatchers when drivers enter or leave them.
+      </p>
 
       <MapLibreMap
         className="h-96 w-full rounded-lg"
@@ -167,33 +162,46 @@ export function ZoneManagerPage() {
           <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
             <tr>
               <th className="px-3 py-2">Name</th>
-              <th className="px-3 py-2">Kind</th>
-              <th className="px-3 py-2">Fee</th>
               <th className="px-3 py-2">AWS</th>
+              <th className="px-3 py-2">Created</th>
               <th className="px-3 py-2 text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
             {loading && (
-              <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400">Loading…</td></tr>
+              <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-400">Loading…</td></tr>
             )}
             {!loading && zones.length === 0 && (
-              <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400">No zones yet.</td></tr>
+              <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-400">No zones yet.</td></tr>
             )}
             {zones.map((z) => (
               <tr key={z.id} className="border-t border-slate-100">
                 <td className="px-3 py-2 font-medium">
-                  <span className="mr-2 inline-block h-3 w-3 rounded" style={{ background: z.color }} />
+                  <span
+                    className="mr-2 inline-block h-3 w-3 rounded"
+                    style={{ background: z.color }}
+                  />
                   {z.name}
                 </td>
-                <td className="px-3 py-2">{z.kind}</td>
-                <td className="px-3 py-2">₦{z.fee.toLocaleString()}</td>
                 <td className="px-3 py-2 text-xs text-slate-500">
                   {z.aws_geofence_id ? '✓ synced' : '—'}
                 </td>
+                <td className="px-3 py-2 text-xs text-slate-500">
+                  {new Date(z.created_at).toLocaleDateString()}
+                </td>
                 <td className="px-3 py-2 text-right">
-                  <button onClick={() => openEdit(z)} className="mr-2 text-slate-600 hover:text-slate-900">Edit</button>
-                  <button onClick={() => remove(z)} className="text-red-600 hover:text-red-700">Delete</button>
+                  <button
+                    onClick={() => openEdit(z)}
+                    className="mr-2 text-slate-600 hover:text-slate-900"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => remove(z)}
+                    className="text-red-600 hover:text-red-700"
+                  >
+                    Delete
+                  </button>
                 </td>
               </tr>
             ))}
@@ -214,6 +222,7 @@ export function ZoneManagerPage() {
                 <input
                   value={draftName}
                   onChange={(e) => setDraftName(e.target.value)}
+                  placeholder="e.g. Ajegunle, Apapa Wharf"
                   className="mt-1 w-full rounded border px-2 py-1"
                 />
               </label>
@@ -226,27 +235,11 @@ export function ZoneManagerPage() {
                   className="mt-1 h-9 w-full"
                 />
               </label>
-              <label className="text-sm">
-                Kind
-                <select
-                  value={draftKind}
-                  onChange={(e) => setDraftKind(e.target.value as 'coverage' | 'alert')}
-                  className="mt-1 w-full rounded border px-2 py-1"
-                >
-                  <option value="coverage">Coverage (service area)</option>
-                  <option value="alert">Alert (driver leaves → notify)</option>
-                </select>
-              </label>
-              <label className="text-sm">
-                Fee (₦, 0 for alert zones)
-                <input
-                  type="number"
-                  value={draftFee}
-                  onChange={(e) => setDraftFee(parseInt(e.target.value) || 0)}
-                  className="mt-1 w-full rounded border px-2 py-1"
-                />
-              </label>
             </div>
+
+            <p className="mb-2 text-xs text-slate-500">
+              Use the polygon tool (top-left of the map) to draw the zone. Double-click to finish.
+            </p>
 
             <MapLibreMap
               className="h-80 w-full rounded border"
@@ -254,13 +247,21 @@ export function ZoneManagerPage() {
               onPolygonComplete={setDraftPolygon}
               geofences={
                 draftPolygon
-                  ? [{ id: 'draft', name: draftName || 'Draft', polygon: draftPolygon, color: draftColor }]
+                  ? [{
+                      id: 'draft',
+                      name: draftName || 'Draft',
+                      polygon: draftPolygon,
+                      color: draftColor,
+                    }]
                   : []
               }
             />
 
             <div className="mt-3 flex justify-end gap-2">
-              <button onClick={() => setShowModal(false)} className="rounded border px-3 py-1.5 text-sm">
+              <button
+                onClick={() => setShowModal(false)}
+                className="rounded border px-3 py-1.5 text-sm"
+              >
                 Cancel
               </button>
               <button
